@@ -1,0 +1,214 @@
+﻿# Variant System (Server-to-Client RPC)
+
+## What Is It
+
+The variant system is how the server calls functions on the client. Need to show a dialog? Send a variant. Need to spawn a player? Variant. Need to display a chat message? Variant. It's the primary mechanism for anything beyond raw movement and tile data.
+
+Variants are sent inside a tank packet with `type=1` (CALL_FUNCTION) and the EXTENDED flag set. The extended data contains a serialized list of typed arguments.
+
+## Binary Format
+
+```
+[1 byte]  variant_count       (how many arguments total, including function name)
+
+Per variant:
+  [1 byte]  index             (0 = function name, 1-7 = arguments)
+  [1 byte]  type              (data type ID)
+  [N bytes] data              (payload, format depends on type)
+```
+
+## Data Types
+
+Sourced from Proton SDK `Variant::eType`:
+
+| ID | Type | Payload | Example |
+|----|------|---------|---------|
+| 0 | UNUSED | not serialized | — |
+| 1 | FLOAT | 4 bytes (IEEE 754 float) | 3.14 |
+| 2 | STRING | 4 bytes length (uint32) + raw chars (no null) | "Hello" |
+| 3 | VEC2 | 8 bytes (2x float: x, y) | (100.0, 200.0) |
+| 4 | VEC3 | 12 bytes (3x float: x, y, z) | (1.0, 2.0, 3.0) |
+| 5 | UINT32 | 4 bytes (uint32) | 42 |
+| 6 | ENTITY | not serialized | — |
+| 7 | COMPONENT | not serialized | — |
+| 8 | RECT | not serialized in practice | — |
+| 9 | INT32 | 4 bytes (int32) | -1 |
+
+`SerializeToMem()` only emits index/type/data for types whose `GetSizeOfData()` returns >0 (or for STRING which has its own length prefix). Types 0, 6, 7 are silently skipped on the wire — index numbers stay sequential because the writer increments only when a value is actually emitted.
+
+## How to Send a Variant
+
+```cpp
+// 1. Build the variant buffer
+std::vector<uint8_t> buf;
+
+uint8_t count = 2;  // function name + 1 argument
+buf.push_back(count);
+
+// Variant 0: function name (ALWAYS a string at index 0)
+buf.push_back(0);   // index
+buf.push_back(2);   // type = STRING
+std::string name = "OnConsoleMessage";
+uint32_t len = name.size();
+buf.insert(buf.end(), (uint8_t*)&len, (uint8_t*)&len + 4);
+buf.insert(buf.end(), name.begin(), name.end());
+
+// Variant 1: the message text
+buf.push_back(1);   // index
+buf.push_back(2);   // type = STRING
+std::string msg = "Welcome to the server!";
+len = msg.size();
+buf.insert(buf.end(), (uint8_t*)&len, (uint8_t*)&len + 4);
+buf.insert(buf.end(), msg.begin(), msg.end());
+
+// 2. Wrap in a tank packet
+GameUpdatePacket tank = {};
+tank.type      = 1;       // CALL_FUNCTION
+tank.net_id    = -1;      // -1 = send to this peer (not broadcast by net_id)
+tank.flags     = 0x08;    // EXTENDED
+tank.int_data  = 0;       // delay in ms (0 = execute immediately)
+tank.data_size = buf.size();
+
+// 3. Send
+SendTankPacket(peer, &tank, buf.data(), buf.size());
+```
+
+## Important Rules
+
+1. **Index 0 must ALWAYS be a STRING containing the function name.** If you put anything else at index 0, the client ignores the entire packet.
+2. **Maximum 8 arguments** (index 0 through 7). Defined by `C_MAX_VARIANT_LIST_PARMS = 8` in the original Proton source. Most server functions use 2-4.
+3. **`net_id` in the tank packet** determines which player the variant targets. Use -1 for "this connection", or a specific net_id for broadcast scenarios.
+4. **`int_data` is the delay** in milliseconds before the client executes the function. Usually 0. Some retail flows use `0xFFFFFFFF` as "execute immediately, no scheduling"; both work in practice.
+5. **Strings do NOT include a null terminator** in the variant payload. The 4-byte uint32 length prefix handles sizing.
+6. **Non-serializable types** (UNUSED/ENTITY/COMPONENT/RECT) are skipped silently by the writer. If you populate index 3 with a STRING and leave indices 1-2 unset, the wire indices will still be 0,1,2,3 but only the populated ones appear — verify `varsUsed` in your serializer matches your expectation.
+
+## All Variant Functions
+
+### Essential (needed for a working server)
+
+| Function | Arguments | When to send |
+|----------|-----------|--------------|
+| `OnSuperMainStart` | (uint) items_hash, (str) cdn_url, (str) settings | After login validation |
+| `OnSpawn` | (str) spawn_data | Player enters world |
+| `OnRemove` | (str) remove_data | Player leaves world |
+| `OnConsoleMessage` | (str) text | Chat messages, system messages |
+| `OnDialogRequest` | (str) dialog_markup | Show UI dialog |
+| `OnTalkBubble` | (int) net_id, (str) text, (int) bubble_type | Chat bubble above player |
+| `OnSetPos` | (vec2) position | Teleport player |
+| `SetHasGrowID` | (int) has_id, (str) name, (str) token | After login, account info |
+| `OnRequestWorldSelectMenu` | (str) menu_data | World select screen |
+| `OnFailedToEnterWorld` | — | World join failed |
+| `OnKilled` | — | Player died |
+
+> **OnSuperMainStart variants in the wild.** Many private servers use a longer
+> obfuscated function name like `OnSuperMainStartAcceptLogonHrdxs47254722215a`
+> (concatenated anti-replay marker the retail client recognises). Either form
+> works as long as the string at index 0 starts with `OnSuperMainStart`.
+
+### Player Appearance
+
+| Function | Arguments | When to send |
+|----------|-----------|--------------|
+| `OnSetClothing` | (vec3) hair+shirt+pants, (vec3) shoes+face+hand, (vec3) back+hat+chest, (uint) skin_color, (vec3) ances+invis_flag | Clothing changed |
+| `OnNameChanged` | (int) net_id, (str) new_name | Name/title update |
+| `OnCountryState` | (int) net_id, (str) country_code | Set flag icon |
+| `OnSetFreezeState` | (int) frozen | Freeze/unfreeze player |
+
+### World State
+
+| Function | Arguments | When to send |
+|----------|-----------|--------------|
+| `OnSetCurrentWeather` | (int) weather_id | Change world weather |
+| `OnPlayPositioned` | (str) audio_file | Play sound effect |
+| `OnBillboardChange` | (str) billboard_data | Update vendor billboard |
+
+### Economy & UI
+
+| Function | Arguments | When to send |
+|----------|-----------|--------------|
+| `OnSetBux` | (int) gems, (int) animate | Update gem counter |
+| `OnStoreRequest` | (str) store_data | Open store UI |
+| `OnTextOverlay` | (str) text | Big text on screen |
+| `OnEmoticonDataChanged` | (int) net_id, (int) emote_id | Show emote |
+| `OnProgressUI` | varies | Progress bar |
+
+### Server Management
+
+| Function | Arguments | When to send |
+|----------|-----------|--------------|
+| `OnSendToServer` | (int) port, (int) token, (int) uid, (str) addr, (int) mode | Sub-server transfer |
+
+## OnSpawn Data Format
+
+The second argument of `OnSpawn` is a pipe-delimited string with player info. The exact format used by Gurotopia (verified from `include/on/Spawn.cpp`):
+
+```
+spawn|avatar
+netID|1
+userID|12345
+colrect|0|0|20|30
+posXY|50|36
+name|`wPlayerName``
+country|us
+invis|0
+mstate|0
+smstate|0
+onlineID|
+
+type|local
+```
+
+| Field | Purpose |
+|-------|---------|
+| `netID` | This player's network ID in the world (unique per world) |
+| `userID` | Permanent account ID from database |
+| `colrect` | Collision rectangle: `x|y|width|height` (default `0|0|20|30`) |
+| `posXY` | Spawn position. Gurotopia divides by 32 to send tile-grid coords here; some servers send raw pixels. Both work; check what your client build expects. |
+| `name` | Display name with color codes (backtick format), trailing `` `` `` resets color |
+| `country` | Two-letter country code for flag display |
+| `invis` | 1 = invisible (moderator ghost mode) |
+| `mstate` | 1 = moderator |
+| `smstate` | 1 = super moderator |
+| `onlineID` | Optional online identifier (often empty) |
+| `type` | `local` = this is YOU. Omit entirely for other players |
+
+> The `type|local` line is critical. The client uses it to know which avatar to
+> control. Send it only to the player themselves, never to others.
+
+## OnRemove Data Format
+
+```
+netID|1
+pId|12345
+```
+
+Broadcast this to all remaining players when someone leaves.
+
+## OnSendToServer (Sub-Server Transfer)
+
+```
+[0] "OnSendToServer"     (str)
+[1] 17092                (int)  target port
+[2] 8472913              (int)  auth token
+[3] 12345                (int)  user ID
+[4] "1.2.3.4|DOOR|uuid"  (str)  ip|door_id|uuid_token
+[5] 2                    (int)  login mode (2 = transfer)
+```
+
+The client disconnects from the current server and reconnects to the target with `lmode=2` and the provided token for authentication.
+
+## Color Codes (for text in variants)
+
+Backtick + single character escape sequences:
+
+```
+`0  White         `1  Cyan          `2  Green
+`3  Light Blue    `4  Red           `5  Purple
+`6  Gold/Yellow   `7  Gray          `8  Orange
+`9  Yellow        `a  Pale Yellow   `b  Pale Green
+`c  Pink          `d  Lavender      `e  Beige
+`q  Teal          `w  White Bold    `o  Reset/Default
+`p  Rainbow (animated)               ``  Literal backtick
+```
+
+Example: `` `4Error: `oSomething went wrong `` displays "Error:" in red and the rest in default color.
